@@ -1,0 +1,83 @@
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "Dockerfile"
+      - "requirements.txt"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT_ID: discord-verify-bot-jafer
+  GCP_REGION: us-central1
+  SERVICE_NAME: googlers-verify-bot
+  AR_REPO: verify-bot
+
+jobs:
+  test-before-deploy:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check app tests scripts
+      - run: pytest
+
+  deploy:
+    name: Build & Deploy Cloud Run
+    needs: test-before-deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (Keyless WIF)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/1093370785496/locations/global/workloadIdentityPools/github-actions/providers/github-oidc
+          service_account: github-deployer-sa@discord-verify-bot-jafer.iam.gserviceaccount.com
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push container image
+        env:
+          IMAGE_BASE: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/bot
+        run: |
+          docker build -t "${IMAGE_BASE}:${GITHUB_SHA}" -t "${IMAGE_BASE}:latest" .
+          docker push "${IMAGE_BASE}:${GITHUB_SHA}"
+          docker push "${IMAGE_BASE}:latest"
+
+      - name: Deploy new Cloud Run revision
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE_NAME }}
+          region: ${{ env.GCP_REGION }}
+          image: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/bot:${{ github.sha }}
+
+      - name: Smoke test /health endpoint
+        run: |
+          echo "Checking ${{ steps.deploy.outputs.url }}/health ..."
+          RESP=$(curl -fsS "${{ steps.deploy.outputs.url }}/health")
+          echo "$RESP"
+          echo "$RESP" | grep -q '"status":"ok"'
+          echo "$RESP" | grep -q '"bot_token_configured":true'
