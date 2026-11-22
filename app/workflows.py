@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import UTC, datetime
 from typing import Any
 
 from app.config import Settings
 from app.discord_api import DiscordClient
+from app.tasks import TaskDispatcher
 from app.verifier import ProofVerifier, VerificationResult, normalize_mime_type
 
 logger = logging.getLogger(__name__)
@@ -59,6 +61,44 @@ def build_mod_buttons(target_user_id: str) -> list[dict[str, Any]]:
                     "label": "Reject",
                     "emoji": {"name": "❌"},
                     "custom_id": f"mod_reject:{target_user_id}",
+                },
+            ],
+        }
+    ]
+
+
+def build_auto_reject_override_buttons(target_user_id: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": 1,
+            "components": [
+                {
+                    "type": 2,
+                    "style": 3,  # Success (green)
+                    "label": "Override: Verify",
+                    "emoji": {"name": "✅"},
+                    "custom_id": f"mod_verify:{target_user_id}",
+                },
+                {
+                    "type": 2,
+                    "style": 1,  # Primary (blurple)
+                    "label": "Override: Passed HC",
+                    "emoji": {"name": "🟡"},
+                    "custom_id": f"mod_hc:{target_user_id}",
+                },
+                {
+                    "type": 2,
+                    "style": 4,  # Danger (red)
+                    "label": "Reject w/ Note",
+                    "emoji": {"name": "❌"},
+                    "custom_id": f"mod_reject:{target_user_id}",
+                },
+                {
+                    "type": 2,
+                    "style": 2,  # Secondary (gray)
+                    "label": "Dismiss",
+                    "emoji": {"name": "🗑️"},
+                    "custom_id": f"mod_dismiss:{target_user_id}",
                 },
             ],
         }
@@ -180,6 +220,7 @@ async def process_verification_task(
     settings: Settings,
     discord: DiscordClient,
     verifier: ProofVerifier,
+    dispatcher: TaskDispatcher | None = None,
 ) -> dict[str, Any]:
     app_id = str(payload["application_id"])
     interaction_token = str(payload["interaction_token"])
@@ -297,51 +338,174 @@ async def process_verification_task(
         )
         return {"status": "auto_processed", "verdict": result.verdict}
 
-    # Route everything else (MANUAL_REVIEW, MEDIUM/LOW confidence, or Gemini failure) to mods
-    verdict_label = result.verdict if result else "AI_ERROR"
-    confidence_label = result.confidence if result else "N/A"
-    proof_type_label = result.proof_type if result else "error"
-    reason_text = (
-        result.reason
-        if result
-        else f"Automated review failed ({eval_error}); please review manually."
-    )
+    # If Vertex AI itself errored, fall back to manual review (never auto-reject on an internal error)
+    if result is None:
+        reason_text = f"Automated review failed ({eval_error}); please review manually."
+        review_embed: dict[str, Any] = {
+            "title": "Verification Request (Manual Review — AI Error)",
+            "description": (
+                f"**User:** <@{user_id}> (`{username}` / `{display_name}`)\n"
+                f"**Additional Info:** {additional_info or '_None_'}\n"
+                f"**Assessment:** {reason_text}"
+            ),
+            "color": COLOR_INFO,
+            "fields": [
+                {"name": "Suggested Verdict", "value": "AI_ERROR", "inline": True},
+                {"name": "Confidence", "value": "N/A", "inline": True},
+                {"name": "Proof Type", "value": "error", "inline": True},
+                {"name": "User ID", "value": user_id, "inline": True},
+            ],
+            "timestamp": _now_iso(),
+        }
+        if first_image_filename:
+            review_embed["image"] = {"url": f"attachment://{first_image_filename}"}
 
-    review_embed: dict[str, Any] = {
-        "title": "Verification Request (Manual Review)",
+        await discord.send_channel_message(
+            settings.channel_verifications,
+            embeds=[review_embed],
+            components=build_mod_buttons(user_id),
+            files=downloaded,
+        )
+        await discord.edit_interaction_response(
+            app_id,
+            interaction_token,
+            content=(
+                "📩 **Submitted for moderator review!** Our automated reviewer ran into a temporary "
+                "issue, so your proof has been sent privately to the moderators. You'll receive a DM once reviewed."
+            ),
+        )
+        return {"status": "queued_for_manual_review", "verdict": "AI_ERROR"}
+
+    # Bar for HIGH-confidence VERIFY or PASSED_HC was not met -> reject by default with Gemini justification,
+    # and post an override card in #verifications with a 48h auto-delete TTL.
+    member = await discord.get_guild_member(settings.discord_guild_id, user_id)
+    existing_roles = {str(r) for r in ((member or {}).get("roles") or [])}
+    # Never strip an existing verified or Passed Interviews role on a failed upgrade attempt
+    if (
+        settings.role_verified not in existing_roles
+        and settings.role_passed_hc not in existing_roles
+    ):
+        await discord.update_member_roles(
+            settings.discord_guild_id,
+            user_id,
+            settings.role_unverified,
+            [],
+        )
+
+    ttl_hours = max(1, settings.auto_reject_ttl_hours)
+    ttl_seconds = ttl_hours * 3600
+    expire_unix = int(time.time()) + ttl_seconds
+
+    rejection_msg = (
+        "❌ **Verification not approved automatically.**\n\n"
+        f"**Reason:** {result.reason}\n\n"
+        f"A moderator can still review and override this within the next **{ttl_hours} hours**, "
+        "or you can resubmit anytime with clearer proof of offer acceptance, employment, or Hiring Committee pass."
+    )
+    dm_ok, dm_err = await discord.send_dm(user_id, rejection_msg)
+    await discord.edit_interaction_response(app_id, interaction_token, content=rejection_msg)
+
+    # Archive immediately to #verifications-logs for a permanent audit trail
+    dm_note = "" if dm_ok else f" *(DM skipped: {dm_err})*"
+    log_reject_embed: dict[str, Any] = {
+        "title": f"Auto-Rejected Verification ({result.verdict} / {result.confidence})",
         "description": (
             f"**User:** <@{user_id}> (`{username}` / `{display_name}`)\n"
             f"**Additional Info:** {additional_info or '_None_'}\n"
-            f"**Gemini Assessment:** {reason_text}"
+            f"**Gemini Justification:** {result.reason}"
         ),
-        "color": COLOR_INFO,
+        "color": COLOR_DANGER,
         "fields": [
-            {"name": "Suggested Verdict", "value": verdict_label, "inline": True},
-            {"name": "Confidence", "value": confidence_label, "inline": True},
-            {"name": "Proof Type", "value": proof_type_label, "inline": True},
+            {"name": "Verdict", "value": result.verdict, "inline": True},
+            {"name": "Confidence", "value": result.confidence, "inline": True},
+            {"name": "Proof Type", "value": result.proof_type, "inline": True},
             {"name": "User ID", "value": user_id, "inline": True},
         ],
         "timestamp": _now_iso(),
     }
     if first_image_filename:
-        review_embed["image"] = {"url": f"attachment://{first_image_filename}"}
+        log_reject_embed["image"] = {"url": f"attachment://{first_image_filename}"}
 
     await discord.send_channel_message(
-        settings.channel_verifications,
-        embeds=[review_embed],
-        components=build_mod_buttons(user_id),
+        settings.channel_logs,
+        content=(
+            f"❌ | User <@{user_id}> auto-rejected (bar for `verified` / `passed HC` not met). "
+            f"Override window open in <#{settings.channel_verifications}> for {ttl_hours}h.{dm_note}"
+        ),
+        embeds=[log_reject_embed],
         files=downloaded,
     )
 
-    await discord.edit_interaction_response(
-        app_id,
-        interaction_token,
-        content=(
-            "📩 **Submitted for moderator review!** Your proof has been sent privately to the "
-            "moderators. You'll receive a DM once your status is updated."
+    # Post 48h mod-override card to #verifications
+    override_embed: dict[str, Any] = {
+        "title": f"Auto-Rejected — {ttl_hours}h Mod Override Window",
+        "description": (
+            f"**User:** <@{user_id}> (`{username}` / `{display_name}`)\n"
+            f"**Additional Info:** {additional_info or '_None_'}\n"
+            f"**Gemini Justification (sent to user):** {result.reason}\n"
+            f"**Auto-deletes:** <t:{expire_unix}:R>"
         ),
+        "color": COLOR_DANGER,
+        "fields": [
+            {"name": "Verdict", "value": result.verdict, "inline": True},
+            {"name": "Confidence", "value": result.confidence, "inline": True},
+            {"name": "Proof Type", "value": result.proof_type, "inline": True},
+            {"name": "User ID", "value": user_id, "inline": True},
+        ],
+        "timestamp": _now_iso(),
+    }
+    if first_image_filename:
+        override_embed["image"] = {"url": f"attachment://{first_image_filename}"}
+
+    posted = await discord.send_channel_message(
+        settings.channel_verifications,
+        embeds=[override_embed],
+        components=build_auto_reject_override_buttons(user_id),
+        files=downloaded,
     )
-    return {"status": "queued_for_manual_review", "verdict": verdict_label}
+
+    posted_id = str(posted.get("id") or "")
+    if posted_id and dispatcher is not None:
+        try:
+            dispatcher.enqueue(
+                "/tasks/expire-verification",
+                {
+                    "channel_id": settings.channel_verifications,
+                    "message_id": posted_id,
+                    "user_id": user_id,
+                },
+                delay_seconds=ttl_seconds,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Failed scheduling %dh TTL expiry for message %s: %s", ttl_hours, posted_id, exc
+            )
+
+    return {
+        "status": "auto_rejected",
+        "verdict": result.verdict,
+        "confidence": result.confidence,
+        "override_message_id": posted_id,
+    }
+
+
+async def process_expire_verification_task(
+    payload: dict[str, Any],
+    settings: Settings,
+    discord: DiscordClient,
+) -> dict[str, Any]:
+    channel_id = str(payload.get("channel_id") or settings.channel_verifications)
+    message_id = str(payload.get("message_id") or "")
+    if not message_id:
+        return {"status": "missing_message_id"}
+
+    deleted = await discord.delete_channel_message(channel_id, message_id)
+    if deleted:
+        logger.info(
+            "Auto-expired override message %s from channel %s after TTL", message_id, channel_id
+        )
+        return {"status": "expired_deleted", "message_id": message_id}
+    return {"status": "already_handled", "message_id": message_id}
 
 
 async def process_mod_action_task(
@@ -349,7 +513,7 @@ async def process_mod_action_task(
     settings: Settings,
     discord: DiscordClient,
 ) -> dict[str, Any]:
-    action = str(payload["action"])  # "verify" | "passed_hc" | "reject"
+    action = str(payload["action"])  # "verify" | "passed_hc" | "reject" | "dismiss"
     target_user_id = str(payload["target_user_id"])
     moderator_id = str(payload["moderator_id"])
     moderator_name = str(payload.get("moderator_name") or moderator_id)
@@ -357,6 +521,22 @@ async def process_mod_action_task(
     source_message_id = payload.get("source_message_id")
     app_id = str(payload["application_id"])
     interaction_token = str(payload["interaction_token"])
+
+    if action == "dismiss":
+        deleted = (
+            await discord.delete_channel_message(
+                settings.channel_verifications, str(source_message_id)
+            )
+            if source_message_id
+            else False
+        )
+        msg = (
+            f"🗑️ Dismissed auto-rejected verification card for <@{target_user_id}>."
+            if deleted
+            else "ℹ️ This verification card was already removed."
+        )
+        await discord.edit_interaction_response(app_id, interaction_token, content=msg)
+        return {"status": "dismissed" if deleted else "already_processed"}
 
     if action == "verify":
         add_role_name, add_role_id = "verified", settings.role_verified

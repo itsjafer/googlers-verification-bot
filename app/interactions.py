@@ -166,7 +166,7 @@ async def _dispatch_task(
 ) -> None:
     if settings.inline_tasks:
         if path == "/tasks/process-verification":
-            await process_verification_task(payload, settings, discord, verifier)
+            await process_verification_task(payload, settings, discord, verifier, dispatcher)
         elif path == "/tasks/process-mod-action":
             await process_mod_action_task(payload, settings, discord)
         else:
@@ -280,7 +280,7 @@ async def handle_interaction(
             )
 
         # Moderator action buttons in #verifications
-        if custom_id.startswith(("mod_verify:", "mod_hc:", "mod_reject:")):
+        if custom_id.startswith(("mod_verify:", "mod_hc:", "mod_reject:", "mod_dismiss:")):
             if not has_mod_permission(interaction):
                 return ephemeral_message(
                     "You need the **Manage Roles** permission to perform this action."
@@ -289,9 +289,10 @@ async def handle_interaction(
             prefix, _, target_user_id = custom_id.partition(":")
             source_message_id = str((interaction.get("message") or {}).get("id") or "")
 
-            if prefix == "mod_verify":
+            if prefix in ("mod_verify", "mod_dismiss"):
+                action = "verify" if prefix == "mod_verify" else "dismiss"
                 task_payload = {
-                    "action": "verify",
+                    "action": action,
                     "target_user_id": target_user_id,
                     "moderator_id": caller_id,
                     "moderator_name": caller_display,

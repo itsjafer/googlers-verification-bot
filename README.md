@@ -12,8 +12,9 @@ flowchart LR
     CT -->|"POST /tasks/process-verification"| CR
     CR -->|"Structured JSON Evaluation"| V["Vertex AI (gemini-3.5-flash-lite)"]
     CR -->|"HIGH confidence VERIFY / PASSED_HC"| R["Grant Role + DM + Archive to #verifications-logs"]
-    CR -->|"MANUAL_REVIEW / LOW-MEDIUM"| M["Post to #verifications with 1-Click Mod Buttons"]
-    M -->|"Mod clicks Verify / Passed HC / Reject"| CR
+    CR -->|"Bar not met (REJECT / non-HIGH)"| M["Auto-Reject + DM Gemini Reason + 48h Override Card in #verifications"]
+    M -->|"Mod overrides or dismisses"| CR
+    CT -->|"48h TTL expires -> POST /tasks/expire-verification"| CR
 
     G["Current Googler (@google.com)"] -->|"Clicks Internal Form Button"| F["@google.com Google Form (Pre-filled Discord ID)"]
     F -->|"Apps Script POST /internal-verify"| CR
@@ -28,8 +29,8 @@ flowchart LR
 
 ## Features
 - **In-Discord Proof Upload Modal:** Accepts 1–2 screenshots or PDFs (up to 10 MB each) plus optional context; skips already-verified users.
-- **Structured AI Verification:** Evaluates proof against explicit criteria (`VERIFY`, `PASSED_HC`, `MANUAL_REVIEW`), hardened against prompt injection, and only auto-approves on `HIGH` confidence.
-- **1-Click Moderator Review Cards:** Borderline cases are posted to `#verifications` with Gemini's reasoning, re-uploaded proof attachment, and **`[✅ Verify]` `[🟡 Passed HC]` `[❌ Reject]`** buttons (with reason modals, idempotent double-click protection, permanent `#verifications-logs` archiving, and graceful handling of closed DMs).
+- **Structured AI Verification:** Evaluates proof against explicit criteria (`VERIFY`, `PASSED_HC`, `REJECT`), hardened against prompt injection. Auto-approves on `HIGH`-confidence `VERIFY` / `PASSED_HC`, and **auto-rejects by default** with Gemini's justification sent directly to the user when the bar isn't met (while still falling back to manual review if Vertex AI itself errors).
+- **48-Hour Mod Override Window + 1-Click Buttons:** Auto-rejected submissions are archived to `#verifications-logs` and also posted to `#verifications` with Gemini's reasoning, proof attachment, and **`[✅ Override: Verify]` `[🟡 Override: Passed HC]` `[❌ Reject w/ Note]` `[🗑️ Dismiss]`** buttons. A scheduled Cloud Task automatically deletes the `#verifications` card after 48 hours (`AUTO_REJECT_TTL_HOURS`) if no mod overrides or dismisses it first.
 - **Slash Commands:** `/verify`, `/passed_hc`, `/reject`, and `/setup_panel` (all gated by `MANAGE_ROLES`).
 - **Internal `@google.com` Form Endpoint (`/internal-verify`):** Pre-filled Google Form link passes each Googler's exact Discord User ID for instant verification (`scripts/internal_form_apps_script.gs`).
 

@@ -21,7 +21,7 @@ def test_normalize_mime_type() -> None:
 
 def test_verification_prompt_includes_key_policies() -> None:
     assert "PASSED_HC" in VERIFICATION_SYSTEM_PROMPT
-    assert "MANUAL_REVIEW" in VERIFICATION_SYSTEM_PROMPT
+    assert "REJECT" in VERIFICATION_SYSTEM_PROMPT
     assert "@google.com" in VERIFICATION_SYSTEM_PROMPT
     assert "@xwf.google.com" in VERIFICATION_SYSTEM_PROMPT
     assert "UNTRUSTED" in VERIFICATION_SYSTEM_PROMPT

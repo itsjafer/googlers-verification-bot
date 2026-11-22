@@ -17,6 +17,7 @@ from app.logging_utils import configure_logging
 from app.tasks import TaskDispatcher, verify_cloud_tasks_oidc
 from app.verifier import ProofVerifier
 from app.workflows import (
+    process_expire_verification_task,
     process_internal_verification,
     process_mod_action_task,
     process_verification_task,
@@ -103,7 +104,9 @@ def create_app(
         if not verify_cloud_tasks_oidc(authorization, cfg):
             raise HTTPException(status_code=403, detail="Unauthorized task invocation")
         payload = await request.json()
-        return await process_verification_task(payload, cfg, discord_client, proof_verifier)
+        return await process_verification_task(
+            payload, cfg, discord_client, proof_verifier, task_dispatcher
+        )
 
     @app.post("/tasks/process-mod-action")
     async def task_process_mod_action(
@@ -114,6 +117,16 @@ def create_app(
             raise HTTPException(status_code=403, detail="Unauthorized task invocation")
         payload = await request.json()
         return await process_mod_action_task(payload, cfg, discord_client)
+
+    @app.post("/tasks/expire-verification")
+    async def task_expire_verification(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        if not verify_cloud_tasks_oidc(authorization, cfg):
+            raise HTTPException(status_code=403, detail="Unauthorized task invocation")
+        payload = await request.json()
+        return await process_expire_verification_task(payload, cfg, discord_client)
 
     @app.post("/internal-verify")
     async def internal_verify(

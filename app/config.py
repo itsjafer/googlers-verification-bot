@@ -42,9 +42,10 @@ class Settings(BaseModel):
     inline_tasks: bool = False
     skip_task_auth: bool = False
 
-    # Upload limits
+    # Upload limits & TTLs
     max_attachment_bytes: int = Field(default=10 * 1024 * 1024)
     max_attachments: int = Field(default=2)
+    auto_reject_ttl_hours: int = Field(default=48)
 
 
 def load_settings() -> Settings:
@@ -87,6 +88,7 @@ def load_settings() -> Settings:
         task_service_account=env("TASK_SERVICE_ACCOUNT", ""),
         inline_tasks=env("INLINE_TASKS", "false").lower() in ("1", "true", "yes"),
         skip_task_auth=env("SKIP_TASK_AUTH", "false").lower() in ("1", "true", "yes"),
+        auto_reject_ttl_hours=int(env("AUTO_REJECT_TTL_HOURS", "48")),
     )
 
 

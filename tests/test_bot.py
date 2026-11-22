@@ -104,6 +104,15 @@ class FakeVerifier:
         return self._result
 
 
+class FakeDispatcher:
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[str, dict[str, Any], int]] = []
+
+    def enqueue(self, path: str, payload: dict[str, Any], *, delay_seconds: int = 0) -> str:
+        self.enqueued.append((path, payload, delay_seconds))
+        return f"fake-task-{len(self.enqueued)}"
+
+
 def _signed_headers(
     signing_key: SigningKey, raw_body: bytes, ts: str = "1700000000"
 ) -> dict[str, str]:
@@ -119,6 +128,17 @@ def _make_app(
     verifier_result: VerificationResult | Exception | None = None,
     internal_form_url_template: str = "https://docs.google.com/forms/d/e/test/viewform?usp=pp_url&entry.123={user_id}",
 ) -> tuple[TestClient, SigningKey, FakeDiscordClient, Settings]:
+    client, sk, fake_discord, settings, _ = _make_app_with_dispatcher(
+        verifier_result=verifier_result,
+        internal_form_url_template=internal_form_url_template,
+    )
+    return client, sk, fake_discord, settings
+
+
+def _make_app_with_dispatcher(
+    verifier_result: VerificationResult | Exception | None = None,
+    internal_form_url_template: str = "https://docs.google.com/forms/d/e/test/viewform?usp=pp_url&entry.123={user_id}",
+) -> tuple[TestClient, SigningKey, FakeDiscordClient, Settings, FakeDispatcher]:
     sk = SigningKey.generate()
     settings = Settings(
         discord_public_key=sk.verify_key.encode().hex(),
@@ -129,6 +149,7 @@ def _make_app(
         skip_task_auth=True,
     )
     fake_discord = FakeDiscordClient()
+    fake_dispatcher = FakeDispatcher()
     fake_verifier = FakeVerifier(
         verifier_result
         or VerificationResult(
@@ -138,8 +159,13 @@ def _make_app(
             reason="DocuSign completion confirmation for Google offer.",
         )
     )
-    app = create_app(settings=settings, discord=fake_discord, verifier=fake_verifier)
-    return TestClient(app), sk, fake_discord, settings
+    app = create_app(
+        settings=settings,
+        discord=fake_discord,
+        verifier=fake_verifier,
+        dispatcher=fake_dispatcher,
+    )
+    return TestClient(app), sk, fake_discord, settings, fake_dispatcher
 
 
 def test_ping_signature_verification() -> None:
@@ -287,12 +313,12 @@ def test_modal_submit_high_confidence_auto_verifies() -> None:
     assert "You're verified" in discord.edited_responses[0]["content"]
 
 
-def test_modal_submit_medium_confidence_routes_to_manual_review_with_buttons() -> None:
-    client, sk, discord, settings = _make_app(
+def test_modal_submit_bar_not_met_auto_rejects_with_reason_and_48h_ttl() -> None:
+    client, sk, discord, settings, dispatcher = _make_app_with_dispatcher(
         VerificationResult(
-            verdict="VERIFY",
-            confidence="MEDIUM",
-            proof_type="recruiter_acceptance_email",
+            verdict="REJECT",
+            confidence="HIGH",
+            proof_type="insufficient_or_unclear",
             reason="Email mentions Google but acceptance wording is slightly cropped.",
         )
     )
@@ -330,16 +356,135 @@ def test_modal_submit_medium_confidence_routes_to_manual_review_with_buttons() -
     body = json.dumps(payload).encode()
     resp = client.post("/interactions", content=body, headers=_signed_headers(sk, body))
     assert resp.status_code == 200
-    assert discord.role_updates == []
-    assert len(discord.channel_messages) == 1
-    review_msg = discord.channel_messages[0]
-    assert review_msg["channel_id"] == settings.channel_verifications
-    btn_ids = [b["custom_id"] for b in review_msg["components"][0]["components"]]
+
+    # User notified via both ephemeral reply and DM with Gemini's justification
+    assert "acceptance wording is slightly cropped" in discord.edited_responses[0]["content"]
+    assert "48 hours" in discord.edited_responses[0]["content"]
+    assert len(discord.dms) == 1
+    assert "acceptance wording is slightly cropped" in discord.dms[0][1]
+
+    # Logged to #verifications-logs AND posted to #verifications for 48h mod override
+    assert len(discord.channel_messages) == 2
+    assert discord.channel_messages[0]["channel_id"] == settings.channel_logs
+    override_msg = discord.channel_messages[1]
+    assert override_msg["channel_id"] == settings.channel_verifications
+    btn_ids = [b["custom_id"] for b in override_msg["components"][0]["components"]]
     assert btn_ids == [
         "mod_verify:111111111111111111",
         "mod_hc:111111111111111111",
         "mod_reject:111111111111111111",
+        "mod_dismiss:111111111111111111",
     ]
+
+    # Scheduled 48h Cloud Task to auto-delete the #verifications card
+    assert len(dispatcher.enqueued) == 1
+    task_path, task_payload, delay = dispatcher.enqueued[0]
+    assert task_path == "/tasks/expire-verification"
+    assert delay == 48 * 3600
+    assert task_payload["message_id"] == override_msg["id"]
+
+
+def test_auto_reject_preserves_existing_passed_hc_role() -> None:
+    client, sk, discord, settings, _ = _make_app_with_dispatcher(
+        VerificationResult(
+            verdict="VERIFY",
+            confidence="MEDIUM",
+            proof_type="recruiter_acceptance_email",
+            reason="Screenshot does not clearly confirm offer signature yet.",
+        )
+    )
+    # User already holds Passed Interviews role
+    discord.members["111111111111111111"]["roles"] = [settings.role_passed_hc]
+
+    payload = {
+        "type": 5,
+        "application_id": settings.discord_app_id,
+        "token": "tok_hc_keep",
+        "guild_id": settings.discord_guild_id,
+        "member": {
+            "user": {"id": "111111111111111111", "username": "alice"},
+            "roles": [settings.role_passed_hc],
+        },
+        "data": {
+            "custom_id": "submit_proof_modal",
+            "components": [
+                {
+                    "type": 18,
+                    "component": {"type": 19, "custom_id": "proof_file", "values": ["att_1"]},
+                },
+            ],
+            "resolved": {
+                "attachments": {
+                    "att_1": {
+                        "id": "att_1",
+                        "filename": "email.png",
+                        "content_type": "image/png",
+                        "size": 5000,
+                        "url": "https://cdn.discordapp.com/attachments/1/2/email.png",
+                    }
+                }
+            },
+        },
+    }
+    body = json.dumps(payload).encode()
+    resp = client.post("/interactions", content=body, headers=_signed_headers(sk, body))
+    assert resp.status_code == 200
+    # Must NOT downgrade existing Passed Interviews member back to unverified
+    assert discord.role_updates == []
+    assert "does not clearly confirm offer signature" in discord.dms[0][1]
+
+
+def test_mod_dismiss_and_48h_expiry_endpoint() -> None:
+    client, sk, discord, settings = _make_app()
+    discord.stored_messages["override_msg_1"] = {"id": "override_msg_1", "embeds": []}
+    discord.stored_messages["override_msg_2"] = {"id": "override_msg_2", "embeds": []}
+
+    # 1. Mod clicks Dismiss -> deletes card immediately, no DM, no role change
+    dismiss_payload = {
+        "type": 3,
+        "application_id": settings.discord_app_id,
+        "token": "dismiss_tok",
+        "guild_id": settings.discord_guild_id,
+        "member": {
+            "user": {"id": "333333333333333333", "username": "modjafer"},
+            "permissions": str(1 << 28),
+            "roles": [],
+        },
+        "message": {"id": "override_msg_1"},
+        "data": {"custom_id": "mod_dismiss:111111111111111111"},
+    }
+    body = json.dumps(dismiss_payload).encode()
+    r1 = client.post("/interactions", content=body, headers=_signed_headers(sk, body))
+    assert r1.status_code == 200
+    assert discord.role_updates == []
+    assert discord.dms == []
+    assert (settings.channel_verifications, "override_msg_1") in discord.deleted_messages
+    assert "Dismissed" in discord.edited_responses[0]["content"]
+
+    # 2. 48h TTL task fires for an unhandled card -> deletes it
+    r2 = client.post(
+        "/tasks/expire-verification",
+        json={
+            "channel_id": settings.channel_verifications,
+            "message_id": "override_msg_2",
+            "user_id": "111111111111111111",
+        },
+    )
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "expired_deleted"
+    assert (settings.channel_verifications, "override_msg_2") in discord.deleted_messages
+
+    # 3. 48h TTL task fires for already-dismissed card -> idempotent no-op
+    r3 = client.post(
+        "/tasks/expire-verification",
+        json={
+            "channel_id": settings.channel_verifications,
+            "message_id": "override_msg_1",
+            "user_id": "111111111111111111",
+        },
+    )
+    assert r3.status_code == 200
+    assert r3.json()["status"] == "already_handled"
 
 
 def test_modal_submit_ai_error_falls_back_gracefully_to_manual_review() -> None:

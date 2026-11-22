@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 from google.auth.transport import requests as google_requests
 from google.cloud import tasks_v2
 from google.oauth2 import id_token
+from google.protobuf import timestamp_pb2
 
 from app.config import Settings
 
@@ -23,7 +25,7 @@ class TaskDispatcher:
             self._client = tasks_v2.CloudTasksClient()
         return self._client
 
-    def enqueue(self, path: str, payload: dict[str, Any]) -> str:
+    def enqueue(self, path: str, payload: dict[str, Any], *, delay_seconds: int = 0) -> str:
         if not self._settings.service_url:
             raise RuntimeError("SERVICE_URL must be configured for Cloud Tasks dispatch")
         if not self._settings.task_service_account:
@@ -36,7 +38,7 @@ class TaskDispatcher:
             self._settings.cloud_tasks_queue,
         )
         target_url = f"{self._settings.service_url}{path}"
-        task = {
+        task: dict[str, Any] = {
             "http_request": {
                 "http_method": tasks_v2.HttpMethod.POST,
                 "url": target_url,
@@ -48,8 +50,12 @@ class TaskDispatcher:
                 },
             }
         }
+        if delay_seconds > 0:
+            scheduled = timestamp_pb2.Timestamp()
+            scheduled.FromSeconds(int(time.time()) + delay_seconds)
+            task["schedule_time"] = scheduled
         created = client.create_task(parent=parent, task=task)
-        logger.info("Enqueued Cloud Task %s -> %s", created.name, path)
+        logger.info("Enqueued Cloud Task %s -> %s (delay=%ds)", created.name, path, delay_seconds)
         return created.name
 
 
